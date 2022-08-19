@@ -6,7 +6,7 @@ use futures::Stream;
 use time::{Duration, OffsetDateTime};
 
 #[async_trait::async_trait]
-pub trait Task {
+pub trait Task: erased_serde::Serialize + 'static {
     type Ok;
     type Err;
 
@@ -19,10 +19,12 @@ pub trait Task {
     async fn exec(self) -> Result<Self::Ok, Self::Err>;
 }
 
+#[async_trait::async_trait]
 pub trait Queue {
+    type Err;
     type StreamFut: Stream<Item = Box<dyn Task>>;
 
-    fn enqueue(&mut self, task: impl Task);
+    async fn enqueue<T: Task>(&mut self, task: T) -> Result<(), Self::Err>;
 
     fn stream(mut self) -> Self::StreamFut;
 }

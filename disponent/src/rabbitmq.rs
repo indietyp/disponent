@@ -1,12 +1,16 @@
+use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use deadpool::managed::{Object, Pool};
-use deadpool_lapin::Manager;
+use deadpool::managed::PoolConfig;
+use deadpool_lapin::{Config, Manager, Pool, Runtime};
 use error_stack::{Report, Result};
-use lapin::ConnectionProperties;
+use lapin::options::BasicPublishOptions;
+use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
+use lapin::{BasicProperties, ConnectionProperties};
+use time::OffsetDateTime;
 
-type Connection = Object<Manager>;
+use crate::{Queue, Task};
 
 #[derive(Debug)]
 pub struct RabbitMqError;
@@ -20,19 +24,86 @@ impl Display for RabbitMqError {
 impl Error for RabbitMqError {}
 
 pub struct RabbitMq {
-    pool: Pool<Manager>,
+    pool: Pool,
 }
 
 impl RabbitMq {
-    pub fn new(
-        addr: &str,
-        properties: ConnectionProperties,
-        pool: usize,
-    ) -> Result<Self, RabbitMqError> {
-        let manager = Manager::new(addr, properties);
-        let pool = Pool::builder(manager)
-            .max_size(pool)
-            .build()
+    pub fn new(runtime: Option<Runtime>, config: Option<Config>) -> Result<Self, RabbitMqError> {
+        let mut pool = config
+            .unwrap_or_default()
+            .create_pool(runtime)
             .map_err(|err| Report::new(err).change_context(RabbitMqError))?;
+
+        Ok(Self { pool })
+    }
+}
+
+pub struct Message<T: Task> {
+    id: TypeId,
+    task: T,
+}
+
+#[async_trait::async_trait]
+impl Queue for RabbitMq {
+    type Err = RabbitMqError;
+    type StreamFut = ();
+
+    async fn enqueue<T: Task>(&self, task: T) -> Result<(), RabbitMqError> {
+        let mut connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| Report::new(err).change_context(RabbitMqError))?;
+
+        let mut props = BasicProperties::default();
+        if let Some(prio) = task.priority() {
+            props = props.with_priority(prio);
+        }
+
+        props = props.with_headers({
+            let mut table = FieldTable::default();
+
+            table.insert(
+                ShortString::from("x-dead-letter-exchange"),
+                AMQPValue::LongString(LongString::from("")),
+            );
+            table.insert(
+                ShortString::from("x-dead-letter-routing-key"),
+                AMQPValue::LongString(LongString::from("DQ")),
+            );
+            table.insert(
+                ShortString::from("x-message-ttl"),
+                AMQPValue::LongLongInt({
+                    let now = OffsetDateTime::now_utc();
+                    let mut future = task.at().unwrap_or_else(|| OffsetDateTime::now_utc());
+                    future += task.delay().unwrap_or_default();
+
+                    (now - future).whole_milliseconds() as i64
+                }),
+            );
+
+            table
+        });
+
+        let channel = connection.create_channel().await?;
+
+        let payload = rmp_serde::to_vec(&Message {
+            id: TypeId::of::<T>(),
+            task,
+        })
+        .map_err(|err| Report::new(err).change_context(RabbitMqError))?;
+
+        channel
+            .basic_publish("", "TQ", BasicPublishOptions::default(), &payload, props)
+            .await
+            .map_err(|err| Report::new(err).change_context(RabbitMqError))?
+            .await
+            .map_err(|err| Report::new(err).change_context(RabbitMqError))?;
+
+        Ok(())
+    }
+
+    fn stream(self) -> Self::StreamFut {
+        todo!()
     }
 }
