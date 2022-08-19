@@ -1,3 +1,6 @@
+#[cfg(feature = "rabbitmq")]
+mod rabbitmq;
+
 use error_stack::Result;
 use futures::Stream;
 use time::{Duration, OffsetDateTime};
