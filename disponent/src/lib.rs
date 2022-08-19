@@ -1,14 +1,31 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
+use error_stack::Result;
+use futures::Stream;
+use time::{Duration, OffsetDateTime};
+
+#[async_trait::async_trait]
+pub trait Task {
+    type Ok;
+    type Err;
+
+    fn delay(&self) -> Option<Duration>;
+    fn at(&self) -> Option<OffsetDateTime>;
+    fn every(&self) -> Option<Duration>;
+
+    fn priority(&self) -> Option<u8>;
+
+    async fn exec(self) -> Result<Self::Ok, Self::Err>;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub trait Queue {
+    type StreamFut: Stream<Item = Box<dyn Task>>;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+    fn enqueue(&mut self, task: impl Task);
+
+    fn stream(mut self) -> Self::StreamFut;
 }
+
+// send and receive
+
+struct Scheduler {}
+
+struct Sender {}
