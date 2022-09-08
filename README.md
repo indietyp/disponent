@@ -23,6 +23,7 @@ The following things are missing until a `0.1` release:
 * [ ] every/retires
 * [ ] memcached as cache
 * [ ] testing of multiple worker nodes
+* [ ] macro to create a new task from a function
 
 The following is planned for the future (if we ever get there):
 
