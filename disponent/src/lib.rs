@@ -13,6 +13,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::Stream;
 use rmpv::Value;
 use time::{Duration, OffsetDateTime};
+use tracing::error;
 use uuid::Uuid;
 
 struct QueueName(String);
@@ -133,7 +134,7 @@ pub trait Task {
 
     type Ok: serde::Serialize;
 
-    fn call<Q: Queue, F: Invoke>(&self, scheduler: &Scheduler<Q, F>) -> Self::Ok;
+    fn call<Q: Queue, C: Cache, F: Invoke>(&self, scheduler: &Scheduler<Q, C, F>) -> Self::Ok;
 }
 
 #[async_trait::async_trait]
@@ -172,57 +173,106 @@ struct Layer<L, R> {
 }
 
 trait Invoke {
-    fn call<Q: Queue, F: Invoke>(&self, id: &str, scheduler: &Scheduler<Q, F>) -> Option<Vec<u8>>;
+    fn call<Q: Queue, C: Cache, F: Invoke>(
+        &self,
+        id: &str,
+        scheduler: &Scheduler<Q, C, F>,
+    ) -> Option<Vec<u8>>;
 }
 
 struct Never;
 impl Invoke for Never {
-    fn call<Q: Queue, F: Invoke>(&self, _: &str, _: &Scheduler<Q, F>) -> Option<Vec<u8>> {
+    fn call<Q: Queue, C: Cache, F: Invoke>(
+        &self,
+        _: &str,
+        _: &Scheduler<Q, C, F>,
+    ) -> Option<Vec<u8>> {
         None
     }
 }
 
 impl<L: Invoke, R: Invoke> Invoke for Layer<L, R> {
-    fn call<Q: Queue, F: Invoke>(&self, id: &str, scheduler: &Scheduler<Q, F>) -> Option<Vec<u8>> {
+    fn call<Q: Queue, C: Cache, F: Invoke>(
+        &self,
+        id: &str,
+        scheduler: &Scheduler<Q, C, F>,
+    ) -> Option<Vec<u8>> {
         todo!()
     }
 }
 
 impl<T: Task> Invoke for T {
-    fn call<Q: Queue, F: Invoke>(&self, id: &str, scheduler: &Scheduler<Q, F>) -> Option<Vec<u8>> {
+    fn call<Q: Queue, C: Cache, F: Invoke>(
+        &self,
+        id: &str,
+        scheduler: &Scheduler<Q, C, F>,
+    ) -> Option<Vec<u8>> {
         (id == T::ID)
             .then(|| Task::call(self, scheduler))
             .map(|res| rmp_serde::encode::to_vec(&res).expect("This should probably not panic"))
     }
 }
 
-struct Scheduler<Q, F> {
+struct Scheduler<Q, C, F> {
     queue: Q,
+    cache: C,
     tasks: F,
 }
 
-impl Scheduler<(), ()> {
-    pub fn new() -> Scheduler<(), Never> {
+impl Scheduler<(), (), ()> {
+    pub fn new() -> Scheduler<(), (), Never> {
         Scheduler {
             queue: (),
+            cache: (),
             tasks: Never,
         }
     }
 }
 
-impl<F: Invoke> Scheduler<(), F> {
-    pub fn with_queue<Q: Queue>(self, queue: Q) -> Scheduler<Q, F> {
+impl<F: Invoke, C> Scheduler<(), C, F> {
+    pub fn with_queue<Q: Queue>(self, queue: Q) -> Scheduler<Q, C, F> {
         Scheduler {
             queue,
+            cache: self.cache,
             tasks: self.tasks,
         }
     }
 }
 
-impl<Q: Queue, F: Invoke> Scheduler<Q, F> {
+impl<F: Invoke, Q> Scheduler<Q, (), F> {
+    pub fn with_cache<C: Cache>(self, cache: C) -> Scheduler<Q, C, F> {
+        Scheduler {
+            queue: self.queue,
+            cache,
+            tasks: self.tasks,
+        }
+    }
+}
+
+struct SchedulerError;
+
+impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
     pub async fn apply(&self, task: TaskRequest) {}
 
     pub fn execute(&self) {}
 
-    pub fn run(self) {}
+    pub async fn run(self) -> Result<(), SchedulerError> {
+        let (tx, rx) = mpsc::channel(32);
+
+        #[cfg(feature = "tokio")]
+        {
+            tokio::spawn(async move {
+                if let Err(err) = self
+                    .queue
+                    .consume(&self.cache, tx)
+                    .await
+                    .change_context(SchedulerError)
+                {
+                    error!(err);
+                };
+            });
+        }
+
+        Ok(())
+    }
 }
