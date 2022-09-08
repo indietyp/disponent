@@ -9,12 +9,13 @@ use futures::{stream, SinkExt, StreamExt};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
-    QueueDeclareOptions,
+    ConfirmSelectOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable, LongString, LongUInt, ShortString};
 use lapin::{BasicProperties, Channel};
 use time::{Duration, OffsetDateTime};
-use tracing::error;
+use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::{mpsc, Cache, Queue, QueueName, TaskRequest, TaskResult, When};
 
@@ -117,7 +118,7 @@ impl RabbitMq {
                     let mut table = FieldTable::default();
                     table.insert(
                         "x-message-ttl".into(),
-                        AMQPValue::from(self.max_dead_message_ttl.whole_milliseconds() as u64),
+                        AMQPValue::from(self.max_dead_message_ttl.whole_milliseconds() as u32),
                     );
                     table
                 },
@@ -249,14 +250,19 @@ impl Queue for RabbitMq {
         });
 
         let channel = self.get_channel().await?;
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .into_report()
+            .change_context(RabbitMqError)?;
 
         let confirm = channel
             .basic_publish(
                 "",
                 &if has_delay {
-                    queue.normal()
-                } else {
                     queue.delay()
+                } else {
+                    queue.normal()
                 },
                 BasicPublishOptions::default(),
                 &rmp_serde::to_vec(&task).unwrap(),
@@ -269,6 +275,10 @@ impl Queue for RabbitMq {
         let confirmation = confirm.await.into_report().change_context(RabbitMqError)?;
         if confirmation.is_ack() {
             // TODO: confirmation, get the requested value back!
+            println!("got an ok!");
+        } else {
+            println!("{:#?}", confirmation);
+            println!("No ok ;-;");
         }
 
         Ok(())
@@ -285,7 +295,7 @@ impl Queue for RabbitMq {
         let immediate = channel
             .basic_consume(
                 &name.normal(),
-                "my_consumer",
+                &Uuid::new_v4().to_string(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
@@ -296,7 +306,7 @@ impl Queue for RabbitMq {
         let dead_letter = channel
             .basic_consume(
                 &name.dead_letter(),
-                "my_consumer",
+                &Uuid::new_v4().to_string(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )

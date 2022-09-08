@@ -287,7 +287,16 @@ impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
         }
     }
 
-    pub async fn apply(&self, task: TaskRequest) {}
+    pub async fn apply(&self, task: TaskRequest) -> Result<(), SchedulerError> {
+        // we definitely need to change the return type here _somehow_
+        self.queue
+            .schedule(task)
+            .await
+            .change_context(SchedulerError)?;
+
+        println!("Ok!");
+        Ok(())
+    }
 
     pub fn execute(&self) {}
 
@@ -346,7 +355,7 @@ mod test {
 
     use crate::rabbitmq::RabbitMq;
     use crate::redis::Redis;
-    use crate::{Cache, Queue, Scheduler, Service, Task};
+    use crate::{Cache, Queue, Scheduler, Service, Task, TaskRequest};
 
     struct Example;
 
@@ -357,7 +366,7 @@ mod test {
         const ID: &'static str = "example";
 
         async fn call<Q: Queue, C: Cache, F: Service>(&self, scheduler: &Scheduler<Q, C, F>) {
-            println!("How are you?!")
+            tracing::info!("How are you?!")
         }
     }
 
@@ -378,7 +387,7 @@ mod test {
                 RabbitMq::new(
                     Some(Runtime::Tokio1),
                     Some(deadpool_lapin::Config {
-                        url: Some("amqp://localhost".to_owned()),
+                        url: Some("amqp://localhost/%2f".to_owned()),
                         pool: None,
                         connection_properties: ConnectionProperties::default(),
                     }),
@@ -398,5 +407,16 @@ mod test {
         println!("{:?}", scheduler.run().await);
 
         assert!(false)
+    }
+
+    #[tokio::test]
+    async fn request() {
+        tracing_subscriber::fmt::init();
+
+        let scheduler = configure();
+        let result = scheduler.apply(TaskRequest::new::<Example>()).await;
+        println!("{:?}", result);
+
+        assert!(true);
     }
 }
