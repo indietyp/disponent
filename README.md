@@ -3,8 +3,8 @@
 *disponent* German noun: "manager"/"dispatcher"/"managing clerk".
 From the latin word *disponens*.
 
-A *disponent* is someone, who is responsible for the assignment of resources and good as
-well as the division of finances or personnel in an organization.
+A *disponent* is someone, who is responsible for the assignment of resources and goods, as
+well as the allocation of finances or personnel in an organization.
 
 ## Status
 
