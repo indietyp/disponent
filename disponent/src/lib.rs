@@ -1,9 +1,15 @@
+#![feature(result_flattening)]
+
 #[cfg(feature = "rabbitmq")]
 mod rabbitmq;
+#[cfg(feature = "redis")]
+mod redis;
 
 use std::any::TypeId;
+use std::sync::Arc;
 
 use error_stack::Result;
+use futures::channel::{mpsc, oneshot};
 use futures::Stream;
 use rmpv::Value;
 use time::{Duration, OffsetDateTime};
@@ -65,7 +71,7 @@ impl When {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct TaskRequest {
     id: Uuid,
 
@@ -113,6 +119,8 @@ impl TaskRequest {
     async fn apply() {}
 }
 
+struct ExecutionError;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TaskResult {
     id: Uuid,
@@ -124,22 +132,36 @@ pub trait Task {
     const ID: &'static str;
 
     type Ok: serde::Serialize;
+
+    fn call<Q: Queue, F: Invoke>(&self, scheduler: &Scheduler<Q, F>) -> Self::Ok;
+}
+
+#[async_trait::async_trait]
+pub trait Cache {
     type Err: std::error::Error;
 
-    fn call<Q: Queue, F: Invoke>(&self, scheduler: &Scheduler<Q, F>)
-    -> Result<Self::Ok, Self::Err>;
+    async fn insert<T: serde::Serialize>(
+        &self,
+        key: &str,
+        value: T,
+        ttl: Option<Duration>,
+    ) -> Result<(), Self::Err>;
+    async fn get<T: serde::de::Deserialize>(&self, key: &str) -> Result<Option<T>, Self::Err>;
 }
 
 #[async_trait::async_trait]
 pub trait Queue {
     type Err: std::error::Error;
-    type StreamFut: Stream<Item = TaskRequest>;
 
     async fn create(&mut self) -> Result<(), Self::Err>;
 
     async fn schedule(&mut self, task: TaskRequest) -> Result<(), Self::Err>;
 
-    fn consume(mut self) -> Self::StreamFut;
+    fn consume<C: Cache>(
+        mut self,
+        cache: &C,
+        requests: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
+    ) -> Result<(), Self::Err>;
 }
 
 // send and receive
@@ -170,7 +192,6 @@ impl<T: Task> Invoke for T {
     fn call<Q: Queue, F: Invoke>(&self, id: &str, scheduler: &Scheduler<Q, F>) -> Option<Vec<u8>> {
         (id == T::ID)
             .then(|| Task::call(self, scheduler))
-            .map(|res| res.map_err(|err| format!("{err:?}")))
             .map(|res| rmp_serde::encode::to_vec(&res).expect("This should probably not panic"))
     }
 }
