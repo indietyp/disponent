@@ -1,23 +1,22 @@
-use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
-use deadpool::managed::PoolConfig;
-use deadpool_lapin::{Config, Manager, Pool, Runtime};
+use deadpool_lapin::{Config, Pool, Runtime};
 use error_stack::{IntoReport, Report, Result, ResultExt};
 use futures::channel::oneshot;
 use futures::{stream, SinkExt, StreamExt};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
-    BasicRejectOptions, QueueDeclareOptions,
+    QueueDeclareOptions,
 };
-use lapin::types::{AMQPValue, FieldTable, LongLongUInt, LongString, LongUInt, ShortString};
-use lapin::{BasicProperties, Channel, ConnectionProperties};
+use lapin::types::{AMQPValue, FieldTable, LongString, LongUInt, ShortString};
+use lapin::{BasicProperties, Channel};
 use time::{Duration, OffsetDateTime};
 use tracing::error;
 
-use crate::{mpsc, Cache, ExecutionError, Queue, QueueName, TaskRequest, TaskResult, When};
+use crate::{mpsc, Cache, Queue, QueueName, TaskRequest, TaskResult, When};
 
 #[derive(Debug)]
 pub struct RabbitMqError;
@@ -49,17 +48,17 @@ impl RabbitMq {
     }
 
     async fn get_channel(&self) -> Result<Channel, RabbitMqError> {
-        let mut connection = self
+        let connection = self
             .pool
             .get()
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         connection
             .create_channel()
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)
     }
 
@@ -91,7 +90,7 @@ impl RabbitMq {
                 Self::declare_arguments(name),
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         channel
@@ -104,7 +103,7 @@ impl RabbitMq {
                 Self::declare_arguments(name),
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         channel
@@ -124,7 +123,7 @@ impl RabbitMq {
                 },
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         Ok(())
@@ -164,7 +163,7 @@ impl RabbitMq {
                             delivery
                                 .ack(BasicAckOptions { multiple: false })
                                 .await
-                                .report()
+                                .into_report()
                                 .change_context(RabbitMqError)?;
                         }
                         Err(err) => {
@@ -176,7 +175,7 @@ impl RabbitMq {
                                     requeue: false,
                                 })
                                 .await
-                                .report()
+                                .into_report()
                                 .change_context(RabbitMqError)?;
                         }
                     }
@@ -187,7 +186,7 @@ impl RabbitMq {
                             requeue: false,
                         })
                         .await
-                        .report()
+                        .into_report()
                         .change_context(RabbitMqError)?;
                 }
             }
@@ -200,7 +199,7 @@ impl RabbitMq {
                 delivery
                     .ack(BasicAckOptions { multiple: false })
                     .await
-                    .report()
+                    .into_report()
                     .change_context(RabbitMqError)?;
             }
         };
@@ -214,12 +213,12 @@ impl RabbitMq {
 impl Queue for RabbitMq {
     type Err = RabbitMqError;
 
-    async fn create(&mut self) -> Result<(), RabbitMqError> {
+    async fn create(&self) -> Result<(), RabbitMqError> {
         self.declare(&QueueName::default()).await
     }
 
     async fn schedule(&self, task: TaskRequest) -> Result<(), RabbitMqError> {
-        let queue = task.queue.unwrap_or_default();
+        let queue = task.queue.clone().unwrap_or_default();
         let mut props = BasicProperties::default();
         props = props.with_priority(task.priority);
 
@@ -254,29 +253,29 @@ impl Queue for RabbitMq {
         let confirm = channel
             .basic_publish(
                 "",
-                if has_delay {
-                    &queue.normal()
+                &if has_delay {
+                    queue.normal()
                 } else {
-                    &queue.delay()
+                    queue.delay()
                 },
                 BasicPublishOptions::default(),
                 &rmp_serde::to_vec(&task).unwrap(),
                 props,
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
-        let confirmation = confirm.await.report().change_context(RabbitMqError)?;
+        let confirmation = confirm.await.into_report().change_context(RabbitMqError)?;
         if confirmation.is_ack() {
-            // confirmation.
+            // TODO: confirmation, get the requested value back!
         }
 
         Ok(())
     }
 
     async fn consume<C: Cache>(
-        self,
+        &self,
         cache: &C,
         requests: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
     ) -> Result<(), Self::Err> {
@@ -291,10 +290,10 @@ impl Queue for RabbitMq {
                 FieldTable::default(),
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
-        let mut dead_letter = channel
+        let dead_letter = channel
             .basic_consume(
                 &name.dead_letter(),
                 "my_consumer",
@@ -302,16 +301,24 @@ impl Queue for RabbitMq {
                 FieldTable::default(),
             )
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         stream::select_all([immediate, dead_letter])
-            .for_each_concurrent(16, |deliver| async move {
-                if let Err(err) = self
-                    .process_delivery(cache, deliver, requests.clone())
-                    .await
-                {
-                    error!(?err);
+            .for_each_concurrent(16, {
+                let requests = Arc::new(requests);
+
+                move |deliver| {
+                    let requests = Arc::clone(&requests);
+
+                    async move {
+                        if let Err(err) = self
+                            .process_delivery(cache, deliver, requests.as_ref().clone())
+                            .await
+                        {
+                            error!(?err);
+                        }
+                    }
                 }
             })
             .await;

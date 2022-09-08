@@ -1,17 +1,17 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::process::Termination;
 
 use deadpool_redis::{Config, Connection, Pool, Runtime};
 use error_stack::{IntoReport, Result, ResultExt};
 use redis::AsyncCommands;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
 use crate::Cache;
 
 #[derive(Debug)]
-struct RedisError;
+pub struct RedisError;
 
 impl Display for RedisError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -49,7 +49,7 @@ impl Redis {
 impl Cache for Redis {
     type Err = RedisError;
 
-    async fn insert<T: Serialize>(
+    async fn insert<T: Serialize + Send>(
         &self,
         key: &str,
         value: T,
@@ -78,7 +78,7 @@ impl Cache for Redis {
         Ok(())
     }
 
-    async fn get<'a, T: Deserialize<'a>>(&'a self, key: &str) -> Result<Option<T>, Self::Err> {
+    async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, Self::Err> {
         let mut connection = self.get_connection().await?;
 
         let value: Option<Vec<u8>> = connection

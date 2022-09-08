@@ -5,15 +5,13 @@ mod rabbitmq;
 #[cfg(feature = "redis")]
 mod redis;
 
-use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use error_stack::{IntoReport, Result, ResultExt};
+use error_stack::{Result, ResultExt};
 use futures::channel::{mpsc, oneshot};
-use futures::{Stream, StreamExt};
-use rmpv::Value;
+use futures::StreamExt;
 use time::{Duration, OffsetDateTime};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -142,30 +140,27 @@ pub trait Task: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait Cache: Send + Sync + 'static {
-    type Err: std::error::Error;
+    type Err: Error;
 
-    async fn insert<T: serde::Serialize>(
+    async fn insert<T: serde::Serialize + Send>(
         &self,
         key: &str,
         value: T,
         ttl: Option<Duration>,
     ) -> Result<(), Self::Err>;
-    async fn get<'a, T: serde::de::Deserialize<'a>>(
-        &'a self,
-        key: &str,
-    ) -> Result<Option<T>, Self::Err>;
+    async fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, Self::Err>;
 }
 
 #[async_trait::async_trait]
 pub trait Queue: Send + Sync + 'static {
-    type Err: std::error::Error;
+    type Err: Error;
 
-    async fn create(&mut self) -> Result<(), Self::Err>;
+    async fn create(&self) -> Result<(), Self::Err>;
 
     async fn schedule(&self, task: TaskRequest) -> Result<(), Self::Err>;
 
     async fn consume<C: Cache>(
-        self,
+        &self,
         cache: &C,
         requests: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
     ) -> Result<(), Self::Err>;
@@ -173,7 +168,7 @@ pub trait Queue: Send + Sync + 'static {
 
 // send and receive
 
-struct Layer<L, R> {
+pub struct Layer<L, R> {
     left: L,
     right: R,
 }
@@ -282,7 +277,7 @@ impl Error for SchedulerError {}
 
 impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
     pub fn attach_task<T>(self, task: T) -> Scheduler<Q, C, Layer<T, F>> {
-        Self {
+        Scheduler {
             queue: self.queue,
             tasks: Layer {
                 left: task,
@@ -296,17 +291,21 @@ impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
 
     pub fn execute(&self) {}
 
-    pub async fn run(self) -> Result<(), SchedulerError> {
+    pub async fn run(self: Arc<Self>) -> Result<(), SchedulerError> {
+        self.queue.create().await.change_context(SchedulerError)?;
+
         info!("Starting up!");
 
         let (tx, mut rx) = mpsc::channel::<(TaskRequest, oneshot::Sender<TaskResult>)>(32);
 
         #[cfg(feature = "tokio")]
         {
+            let this = Arc::clone(&self);
+
             tokio::spawn(async move {
-                if let Err(err) = self
+                if let Err(err) = this
                     .queue
-                    .consume(&self.cache, tx)
+                    .consume(&this.cache, tx)
                     .await
                     .change_context(SchedulerError)
                 {
@@ -318,8 +317,10 @@ impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
         while let Some((req, tx)) = rx.next().await {
             #[cfg(feature = "tokio")]
             {
+                let this = Arc::clone(&self);
+
                 tokio::spawn(async move {
-                    let result = self.tasks.call(&req.exec, &self).await;
+                    let result = this.tasks.call(&req.exec, &this).await;
                     match result {
                         None => error!("Could not find task for specific exec name"),
                         Some(value) => {
@@ -338,8 +339,10 @@ impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use deadpool::Runtime;
-    use redis::RedisError;
+    use lapin::ConnectionProperties;
 
     use crate::rabbitmq::RabbitMq;
     use crate::redis::Redis;
@@ -358,14 +361,15 @@ mod test {
         }
     }
 
-    fn configure() -> Scheduler<impl Queue, impl Cache, impl Service> {
-        Scheduler::new()
+    fn configure() -> Arc<Scheduler<impl Queue, impl Cache, impl Service>> {
+        let scheduler = Scheduler::new()
             .with_cache(
                 Redis::new(
                     Some(Runtime::Tokio1),
                     Some(deadpool_redis::Config {
                         url: Some("redis://localhost/2".to_owned()),
-                        ..Default::default()
+                        connection: None,
+                        pool: None,
                     }),
                 )
                 .expect("should not fail"),
@@ -374,19 +378,25 @@ mod test {
                 RabbitMq::new(
                     Some(Runtime::Tokio1),
                     Some(deadpool_lapin::Config {
-                        url: Some("amqp:://localhost".to_owned()),
-                        ..Default::default()
+                        url: Some("amqp://localhost".to_owned()),
+                        pool: None,
+                        connection_properties: ConnectionProperties::default(),
                     }),
                 )
                 .expect("should not fail"),
             )
-            .attach_task(Example)
+            .attach_task(Example);
+
+        Arc::new(scheduler)
     }
 
     #[tokio::test]
     async fn run_worker() {
-        let scheduler = configure();
+        tracing_subscriber::fmt::init();
 
-        assert!(scheduler.run().await.is_ok())
+        let scheduler = configure();
+        println!("{:?}", scheduler.run().await);
+
+        assert!(false)
     }
 }
