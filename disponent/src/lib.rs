@@ -6,16 +6,19 @@ mod rabbitmq;
 mod redis;
 
 use std::any::TypeId;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use error_stack::Result;
+use error_stack::{IntoReport, Result, ResultExt};
 use futures::channel::{mpsc, oneshot};
 use futures::{Stream, StreamExt};
 use rmpv::Value;
 use time::{Duration, OffsetDateTime};
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct QueueName(String);
 
 impl QueueName {
@@ -42,12 +45,8 @@ impl Default for QueueName {
     }
 }
 
-enum Event {
-    Retry,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum When {
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+pub enum When {
     Now,
     Moment(OffsetDateTime),
     Delay(Duration),
@@ -73,7 +72,7 @@ impl When {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-struct TaskRequest {
+pub struct TaskRequest {
     id: Uuid,
 
     when: When,
@@ -123,24 +122,26 @@ impl TaskRequest {
 struct ExecutionError;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct TaskResult {
+pub struct TaskResult {
     id: Uuid,
 
     value: Vec<u8>,
 }
 
 #[async_trait::async_trait]
-pub trait Task {
+pub trait Task: Send + Sync + 'static {
     const ID: &'static str;
 
     type Ok: serde::Serialize;
 
-    async fn call<Q: Queue, C: Cache, F: Invoke>(&self, scheduler: &Scheduler<Q, C, F>)
-    -> Self::Ok;
+    async fn call<Q: Queue, C: Cache, F: Service>(
+        &self,
+        scheduler: &Scheduler<Q, C, F>,
+    ) -> Self::Ok;
 }
 
 #[async_trait::async_trait]
-pub trait Cache {
+pub trait Cache: Send + Sync + 'static {
     type Err: std::error::Error;
 
     async fn insert<T: serde::Serialize>(
@@ -149,19 +150,22 @@ pub trait Cache {
         value: T,
         ttl: Option<Duration>,
     ) -> Result<(), Self::Err>;
-    async fn get<T: serde::de::Deserialize>(&self, key: &str) -> Result<Option<T>, Self::Err>;
+    async fn get<'a, T: serde::de::Deserialize<'a>>(
+        &'a self,
+        key: &str,
+    ) -> Result<Option<T>, Self::Err>;
 }
 
 #[async_trait::async_trait]
-pub trait Queue {
+pub trait Queue: Send + Sync + 'static {
     type Err: std::error::Error;
 
     async fn create(&mut self) -> Result<(), Self::Err>;
 
-    async fn schedule(&mut self, task: TaskRequest) -> Result<(), Self::Err>;
+    async fn schedule(&self, task: TaskRequest) -> Result<(), Self::Err>;
 
-    fn consume<C: Cache>(
-        mut self,
+    async fn consume<C: Cache>(
+        self,
         cache: &C,
         requests: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
     ) -> Result<(), Self::Err>;
@@ -175,19 +179,19 @@ struct Layer<L, R> {
 }
 
 #[async_trait::async_trait]
-trait Invoke {
-    async fn call<Q: Queue, C: Cache, F: Invoke>(
+pub trait Service: Send + Sync + 'static {
+    async fn call<Q: Queue, C: Cache, F: Service>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
     ) -> Option<Vec<u8>>;
 }
 
-struct Never;
+pub struct Never;
 
 #[async_trait::async_trait]
-impl Invoke for Never {
-    async fn call<Q: Queue, C: Cache, F: Invoke>(
+impl Service for Never {
+    async fn call<Q: Queue, C: Cache, F: Service>(
         &self,
         _: &str,
         _: &Scheduler<Q, C, F>,
@@ -197,30 +201,39 @@ impl Invoke for Never {
 }
 
 #[async_trait::async_trait]
-impl<L: Invoke, R: Invoke> Invoke for Layer<L, R> {
-    async fn call<Q: Queue, C: Cache, F: Invoke>(
+impl<L: Service, R: Service> Service for Layer<L, R> {
+    async fn call<Q: Queue, C: Cache, F: Service>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
     ) -> Option<Vec<u8>> {
-        todo!()
+        if let Some(result) = self.left.call(id, scheduler).await {
+            Some(result)
+        } else {
+            self.right.call(id, scheduler).await
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl<T: Task> Invoke for T {
-    async fn call<Q: Queue, C: Cache, F: Invoke>(
+impl<T: Task> Service for T {
+    async fn call<Q: Queue, C: Cache, F: Service>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
     ) -> Option<Vec<u8>> {
-        (id == T::ID)
-            .then(|| Task::call(self, scheduler))
-            .map(|res| rmp_serde::encode::to_vec(&res).expect("This should probably not panic"))
+        if id == T::ID {
+            let out = Task::call(self, scheduler).await;
+
+            let out = rmp_serde::encode::to_vec(&out).expect("This should probably not panic");
+            Some(out)
+        } else {
+            None
+        }
     }
 }
 
-struct Scheduler<Q, C, F> {
+pub struct Scheduler<Q, C, F> {
     queue: Q,
     cache: C,
     tasks: F,
@@ -236,7 +249,7 @@ impl Scheduler<(), (), ()> {
     }
 }
 
-impl<F: Invoke, C> Scheduler<(), C, F> {
+impl<F: Service, C> Scheduler<(), C, F> {
     pub fn with_queue<Q: Queue>(self, queue: Q) -> Scheduler<Q, C, F> {
         Scheduler {
             queue,
@@ -246,7 +259,7 @@ impl<F: Invoke, C> Scheduler<(), C, F> {
     }
 }
 
-impl<F: Invoke, Q> Scheduler<Q, (), F> {
+impl<F: Service, Q> Scheduler<Q, (), F> {
     pub fn with_cache<C: Cache>(self, cache: C) -> Scheduler<Q, C, F> {
         Scheduler {
             queue: self.queue,
@@ -256,15 +269,37 @@ impl<F: Invoke, Q> Scheduler<Q, (), F> {
     }
 }
 
+#[derive(Debug)]
 struct SchedulerError;
 
-impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
+impl Display for SchedulerError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error while scheduling data")
+    }
+}
+
+impl Error for SchedulerError {}
+
+impl<Q: Queue, C: Cache, F: Service> Scheduler<Q, C, F> {
+    pub fn attach_task<T>(self, task: T) -> Scheduler<Q, C, Layer<T, F>> {
+        Self {
+            queue: self.queue,
+            tasks: Layer {
+                left: task,
+                right: self.tasks,
+            },
+            cache: self.cache,
+        }
+    }
+
     pub async fn apply(&self, task: TaskRequest) {}
 
     pub fn execute(&self) {}
 
     pub async fn run(self) -> Result<(), SchedulerError> {
-        let (tx, mut rx) = mpsc::channel(32);
+        info!("Starting up!");
+
+        let (tx, mut rx) = mpsc::channel::<(TaskRequest, oneshot::Sender<TaskResult>)>(32);
 
         #[cfg(feature = "tokio")]
         {
@@ -275,7 +310,7 @@ impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
                     .await
                     .change_context(SchedulerError)
                 {
-                    error!(err);
+                    error!(?err);
                 };
             });
         }
@@ -293,10 +328,65 @@ impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
                             }
                         }
                     }
-                })
+                });
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use deadpool::Runtime;
+    use redis::RedisError;
+
+    use crate::rabbitmq::RabbitMq;
+    use crate::redis::Redis;
+    use crate::{Cache, Queue, Scheduler, Service, Task};
+
+    struct Example;
+
+    #[async_trait::async_trait]
+    impl Task for Example {
+        type Ok = ();
+
+        const ID: &'static str = "example";
+
+        async fn call<Q: Queue, C: Cache, F: Service>(&self, scheduler: &Scheduler<Q, C, F>) {
+            println!("How are you?!")
+        }
+    }
+
+    fn configure() -> Scheduler<impl Queue, impl Cache, impl Service> {
+        Scheduler::new()
+            .with_cache(
+                Redis::new(
+                    Some(Runtime::Tokio1),
+                    Some(deadpool_redis::Config {
+                        url: Some("redis://localhost/2".to_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("should not fail"),
+            )
+            .with_queue(
+                RabbitMq::new(
+                    Some(Runtime::Tokio1),
+                    Some(deadpool_lapin::Config {
+                        url: Some("amqp:://localhost".to_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .expect("should not fail"),
+            )
+            .attach_task(Example)
+    }
+
+    #[tokio::test]
+    async fn run_worker() {
+        let scheduler = configure();
+
+        assert!(scheduler.run().await.is_ok())
     }
 }

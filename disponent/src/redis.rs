@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::process::Termination;
 
 use deadpool_redis::{Config, Connection, Pool, Runtime};
@@ -8,9 +10,18 @@ use time::Duration;
 
 use crate::Cache;
 
+#[derive(Debug)]
 struct RedisError;
 
-struct Redis {
+impl Display for RedisError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error during redis operation")
+    }
+}
+
+impl Error for RedisError {}
+
+pub struct Redis {
     pool: Pool,
 }
 
@@ -19,14 +30,18 @@ impl Redis {
         let pool = config
             .unwrap_or_default()
             .create_pool(runtime)
-            .report()
+            .into_report()
             .change_context(RedisError)?;
 
         Ok(Self { pool })
     }
 
     async fn get_connection(&self) -> Result<Connection, RedisError> {
-        self.pool.get().await.report().change_context(RedisError)
+        self.pool
+            .get()
+            .await
+            .into_report()
+            .change_context(RedisError)
     }
 }
 
@@ -40,42 +55,42 @@ impl Cache for Redis {
         value: T,
         ttl: Option<Duration>,
     ) -> Result<(), Self::Err> {
-        let mut connection = self.get_connection().await?;
-
         let value = rmp_serde::to_vec(&value)
-            .report()
+            .into_report()
             .change_context(RedisError)?;
+
+        let mut connection = self.get_connection().await?;
 
         if let Some(ttl) = ttl.filter(|ttl| ttl.is_positive()) {
             connection
                 .set_ex(key, value, ttl.whole_seconds() as usize)
                 .await
-                .report()
-                .change_context(RedisError);
+                .into_report()
+                .change_context(RedisError)?;
         } else {
             connection
                 .set(key, value)
                 .await
-                .report()
+                .into_report()
                 .change_context(RedisError)?;
         }
 
         Ok(())
     }
 
-    async fn get<T: Deserialize>(&self, key: &str) -> Result<Option<T>, Self::Err> {
+    async fn get<'a, T: Deserialize<'a>>(&'a self, key: &str) -> Result<Option<T>, Self::Err> {
         let mut connection = self.get_connection().await?;
 
         let value: Option<Vec<u8>> = connection
             .get(key)
             .await
-            .report()
+            .into_report()
             .change_context(RedisError)?;
 
         if let Some(value) = value {
             rmp_serde::from_slice(&value)
                 .map(Some)
-                .report()
+                .into_report()
                 .change_context(RedisError)
         } else {
             Ok(None)

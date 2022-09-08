@@ -2,18 +2,17 @@ use std::any::TypeId;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use async_stream::{stream, try_stream};
 use deadpool::managed::PoolConfig;
 use deadpool_lapin::{Config, Manager, Pool, Runtime};
 use error_stack::{IntoReport, Report, Result, ResultExt};
 use futures::channel::oneshot;
-use futures::{stream, SinkExt, StreamExt, TryStreamExt};
+use futures::{stream, SinkExt, StreamExt};
 use lapin::message::Delivery;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
     BasicRejectOptions, QueueDeclareOptions,
 };
-use lapin::types::{AMQPValue, FieldTable, LongString, LongUInt, ShortString};
+use lapin::types::{AMQPValue, FieldTable, LongLongUInt, LongString, LongUInt, ShortString};
 use lapin::{BasicProperties, Channel, ConnectionProperties};
 use time::{Duration, OffsetDateTime};
 use tracing::error;
@@ -119,7 +118,7 @@ impl RabbitMq {
                     let mut table = FieldTable::default();
                     table.insert(
                         "x-message-ttl".into(),
-                        LongUInt::from(self.max_dead_message_ttl.whole_milliseconds()).into(),
+                        AMQPValue::from(self.max_dead_message_ttl.whole_milliseconds() as u64),
                     );
                     table
                 },
@@ -131,33 +130,33 @@ impl RabbitMq {
         Ok(())
     }
 
-    fn process_delivery<C: Cache>(
+    async fn process_delivery<C: Cache>(
         &self,
         cache: &C,
         delivery: lapin::Result<Delivery>,
         mut sender: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
     ) -> Result<(), RabbitMqError> {
-        let delivery = delivery.report().map_err(RabbitMqError)?;
+        let delivery = delivery.into_report().change_context(RabbitMqError)?;
         let mut request: TaskRequest = rmp_serde::from_slice(&delivery.data)
-            .report()
-            .map_err(RabbitMqError)?;
+            .into_report()
+            .change_context(RabbitMqError)?;
 
         let (tx, rx) = oneshot::channel::<TaskResult>();
 
         sender
             .send((request.clone(), tx))
             .await
-            .report()
+            .into_report()
             .change_context(RabbitMqError)?;
 
         // TODO: timeout
-        let result = rx.await.report().change_context(RabbitMqError);
+        let result = rx.await.into_report().change_context(RabbitMqError);
 
         match result {
             Err(err) => {
-                error!(err);
+                error!(?err);
 
-                if let Some(retries) = request.retries.checked_sub(-1) {
+                if let Some(retries) = request.retries.checked_sub(1) {
                     request.retries = retries;
 
                     match self.schedule(request).await {
@@ -169,7 +168,7 @@ impl RabbitMq {
                                 .change_context(RabbitMqError)?;
                         }
                         Err(err) => {
-                            error!(err);
+                            error!(?err);
 
                             delivery
                                 .nack(BasicNackOptions {
@@ -194,7 +193,7 @@ impl RabbitMq {
             }
             Ok(ok) => {
                 cache
-                    .insert(&ok.id.to_string(), ok)
+                    .insert(&ok.id.to_string(), ok, None)
                     .await
                     .change_context(RabbitMqError)?;
 
@@ -222,9 +221,7 @@ impl Queue for RabbitMq {
     async fn schedule(&self, task: TaskRequest) -> Result<(), RabbitMqError> {
         let queue = task.queue.unwrap_or_default();
         let mut props = BasicProperties::default();
-        if let Some(prio) = task.priority() {
-            props = props.with_priority(prio);
-        }
+        props = props.with_priority(task.priority);
 
         let delay = match task.when {
             When::Now => None,
@@ -245,7 +242,7 @@ impl Queue for RabbitMq {
             if let Some(delay) = delay {
                 table.insert(
                     ShortString::from("x-message-ttl"),
-                    AMQPValue::LongLongInt(delay.whole_milliseconds().into()),
+                    AMQPValue::LongLongInt(delay.whole_milliseconds() as i64),
                 );
             }
 
@@ -278,7 +275,7 @@ impl Queue for RabbitMq {
         Ok(())
     }
 
-    fn consume<C: Cache>(
+    async fn consume<C: Cache>(
         self,
         cache: &C,
         requests: mpsc::Sender<(TaskRequest, oneshot::Sender<TaskResult>)>,
@@ -310,8 +307,11 @@ impl Queue for RabbitMq {
 
         stream::select_all([immediate, dead_letter])
             .for_each_concurrent(16, |deliver| async move {
-                if let Err(err) = self.process_delivery(cache, deliver, requests.clone()) {
-                    error!(err);
+                if let Err(err) = self
+                    .process_delivery(cache, deliver, requests.clone())
+                    .await
+                {
+                    error!(?err);
                 }
             })
             .await;
