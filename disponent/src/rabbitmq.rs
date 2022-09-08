@@ -10,7 +10,7 @@ use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
 use lapin::{BasicProperties, ConnectionProperties};
 use time::OffsetDateTime;
 
-use crate::{Queue, Task};
+use crate::{Queue, TaskRequest};
 
 #[derive(Debug)]
 pub struct RabbitMqError;
@@ -38,7 +38,7 @@ impl RabbitMq {
     }
 }
 
-pub struct Message<T: Task> {
+pub struct Message<T: TaskRequest> {
     id: TypeId,
     task: T,
 }
@@ -48,7 +48,7 @@ impl Queue for RabbitMq {
     type Err = RabbitMqError;
     type StreamFut = ();
 
-    async fn schedule<T: Task>(&self, task: T) -> Result<(), RabbitMqError> {
+    async fn schedule<T: TaskRequest>(&self, task: T) -> Result<(), RabbitMqError> {
         let mut connection = self
             .pool
             .get()
