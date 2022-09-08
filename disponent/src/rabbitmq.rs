@@ -48,7 +48,7 @@ impl Queue for RabbitMq {
     type Err = RabbitMqError;
     type StreamFut = ();
 
-    async fn enqueue<T: Task>(&self, task: T) -> Result<(), RabbitMqError> {
+    async fn schedule<T: Task>(&self, task: T) -> Result<(), RabbitMqError> {
         let mut connection = self
             .pool
             .get()
@@ -103,7 +103,7 @@ impl Queue for RabbitMq {
         Ok(())
     }
 
-    fn stream(self) -> Self::StreamFut {
+    fn consume(self) -> Self::StreamFut {
         todo!()
     }
 }
