@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use error_stack::Result;
 use futures::channel::{mpsc, oneshot};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use rmpv::Value;
 use time::{Duration, OffsetDateTime};
 use tracing::error;
@@ -129,12 +129,14 @@ struct TaskResult {
     value: Vec<u8>,
 }
 
+#[async_trait::async_trait]
 pub trait Task {
     const ID: &'static str;
 
     type Ok: serde::Serialize;
 
-    fn call<Q: Queue, C: Cache, F: Invoke>(&self, scheduler: &Scheduler<Q, C, F>) -> Self::Ok;
+    async fn call<Q: Queue, C: Cache, F: Invoke>(&self, scheduler: &Scheduler<Q, C, F>)
+    -> Self::Ok;
 }
 
 #[async_trait::async_trait]
@@ -172,8 +174,9 @@ struct Layer<L, R> {
     right: R,
 }
 
+#[async_trait::async_trait]
 trait Invoke {
-    fn call<Q: Queue, C: Cache, F: Invoke>(
+    async fn call<Q: Queue, C: Cache, F: Invoke>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
@@ -181,8 +184,10 @@ trait Invoke {
 }
 
 struct Never;
+
+#[async_trait::async_trait]
 impl Invoke for Never {
-    fn call<Q: Queue, C: Cache, F: Invoke>(
+    async fn call<Q: Queue, C: Cache, F: Invoke>(
         &self,
         _: &str,
         _: &Scheduler<Q, C, F>,
@@ -191,8 +196,9 @@ impl Invoke for Never {
     }
 }
 
+#[async_trait::async_trait]
 impl<L: Invoke, R: Invoke> Invoke for Layer<L, R> {
-    fn call<Q: Queue, C: Cache, F: Invoke>(
+    async fn call<Q: Queue, C: Cache, F: Invoke>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
@@ -201,8 +207,9 @@ impl<L: Invoke, R: Invoke> Invoke for Layer<L, R> {
     }
 }
 
+#[async_trait::async_trait]
 impl<T: Task> Invoke for T {
-    fn call<Q: Queue, C: Cache, F: Invoke>(
+    async fn call<Q: Queue, C: Cache, F: Invoke>(
         &self,
         id: &str,
         scheduler: &Scheduler<Q, C, F>,
@@ -257,7 +264,7 @@ impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
     pub fn execute(&self) {}
 
     pub async fn run(self) -> Result<(), SchedulerError> {
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, mut rx) = mpsc::channel(32);
 
         #[cfg(feature = "tokio")]
         {
@@ -271,6 +278,23 @@ impl<Q: Queue, C: Cache, F: Invoke> Scheduler<Q, C, F> {
                     error!(err);
                 };
             });
+        }
+
+        while let Some((req, tx)) = rx.next().await {
+            #[cfg(feature = "tokio")]
+            {
+                tokio::spawn(async move {
+                    let result = self.tasks.call(&req.exec, &self).await;
+                    match result {
+                        None => error!("Could not find task for specific exec name"),
+                        Some(value) => {
+                            if let Err(_) = tx.send(TaskResult { id: req.id, value }) {
+                                error!("oneshot return was closed");
+                            }
+                        }
+                    }
+                })
+            }
         }
 
         Ok(())
