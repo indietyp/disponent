@@ -9,6 +9,32 @@ use rmpv::Value;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+struct QueueName(String);
+
+impl QueueName {
+    fn normal(&self) -> String {
+        self.0.clone()
+    }
+
+    fn delay(&self) -> String {
+        let mut name = self.0.clone();
+        name.push_str(".DQ");
+        name
+    }
+
+    fn dead_letter(&self) -> String {
+        let mut name = self.0.clone();
+        name.push_str(".XQ");
+        name
+    }
+}
+
+impl Default for QueueName {
+    fn default() -> Self {
+        Self("default".to_owned())
+    }
+}
+
 enum Event {
     Retry,
 }
@@ -49,6 +75,9 @@ struct TaskRequest {
 
     /// This is the path we're using when looking up which task to execute
     exec: String,
+
+    // for now this isn't exposed
+    queue: Option<QueueName>,
 }
 
 impl TaskRequest {
@@ -59,6 +88,7 @@ impl TaskRequest {
             priority: 0,
             retries: 0,
             exec: F::ID.to_string(),
+            queue: None,
         }
     }
 
@@ -105,7 +135,7 @@ pub trait Queue {
     type Err: std::error::Error;
     type StreamFut: Stream<Item = TaskRequest>;
 
-    async fn create(&mut self);
+    async fn create(&mut self) -> Result<(), Self::Err>;
 
     async fn schedule(&mut self, task: TaskRequest) -> Result<(), Self::Err>;
 
